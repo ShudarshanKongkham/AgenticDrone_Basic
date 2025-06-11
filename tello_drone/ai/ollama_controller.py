@@ -2,6 +2,19 @@
 """
 Ollama AI Controller for Tello Drone
 Integrates local LLM (Ollama) with Tello drone for natural language control.
+
+Features:
+- Natural language command processing using Ollama LLM
+- Comprehensive drone control (takeoff, landing, movement, rotations, flips)
+- Real-time sensor monitoring and status display
+- Safety features and command validation
+- Auto-landing prevention with keepalive mechanism
+- Video streaming support
+- Interactive voice/text control mode
+
+The auto-landing prevention feature automatically sends keepalive commands
+every 5 seconds while the drone is flying to prevent the Tello's built-in
+15-second timeout that would cause automatic landing.
 """
 
 import json
@@ -21,7 +34,7 @@ from core.tello_control import TelloController
 class OllamaController:
     """AI-powered drone controller using Ollama for natural language processing."""
     
-    def __init__(self, ollama_host="http://localhost:11434", model="llama3.1"):
+    def __init__(self, ollama_host="http://localhost:11434", model="granite3.3"):
         """
         Initialize the Ollama controller.
         
@@ -36,6 +49,11 @@ class OllamaController:
         self.safety_mode = True
         self.max_altitude = 200  # cm
         self.max_distance = 100  # cm
+        
+        # Keepalive mechanism to prevent auto-landing
+        self.keepalive_thread = None
+        self.keepalive_running = False
+        self.keepalive_interval = 5  # seconds (send keepalive every 5 seconds)
         
         # Command mapping for natural language processing
         self.command_patterns = {
@@ -67,6 +85,38 @@ class OllamaController:
             'stop_video': ['stop video', 'video off', 'camera off', 'stop streaming'],
             'get_status': ['status', 'sensors', 'telemetry', 'info', 'data'],
         }
+    
+    def start_keepalive(self):
+        """Start the keepalive thread to prevent auto-landing."""
+        if self.keepalive_thread is None or not self.keepalive_thread.is_alive():
+            self.keepalive_running = True
+            self.keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
+            self.keepalive_thread.start()
+            print("🔄 Keepalive started - drone will not auto-land")
+    
+    def stop_keepalive(self):
+        """Stop the keepalive thread."""
+        self.keepalive_running = False
+        if self.keepalive_thread and self.keepalive_thread.is_alive():
+            self.keepalive_thread.join(timeout=1)
+        print("⏹️ Keepalive stopped")
+    
+    def _keepalive_loop(self):
+        """Background thread that sends keepalive commands to prevent auto-landing."""
+        keepalive_count = 0
+        while self.keepalive_running:
+            try:
+                if self.tello and self.tello.connected and self.tello.flying:
+                    # Send keepalive command to prevent auto-landing
+                    self.tello.drone.send_keepalive()
+                    keepalive_count += 1
+                    # Only print every 3rd keepalive (every 15 seconds) to reduce noise
+                    if keepalive_count % 3 == 0:
+                        print(f"💓 Keepalive active ({keepalive_count * self.keepalive_interval}s)")
+                time.sleep(self.keepalive_interval)
+            except Exception as e:
+                print(f"⚠️ Keepalive error: {e}")
+                time.sleep(self.keepalive_interval)
     
     def check_ollama_connection(self) -> bool:
         """Check if Ollama server is running and accessible."""
@@ -101,6 +151,9 @@ class OllamaController:
     
     def disconnect_drone(self):
         """Disconnect from Tello drone."""
+        # Stop keepalive first
+        self.stop_keepalive()
+        
         if self.tello:
             self.tello.disconnect()
     
@@ -229,12 +282,20 @@ If the command is dangerous, set safety_check to false and explain why.
         try:
             # Execute the command
             if action == 'takeoff':
-                return self.tello.takeoff()
+                result = self.tello.takeoff()
+                if result:
+                    # Start keepalive after successful takeoff
+                    self.start_keepalive()
+                return result
             
             elif action == 'land':
+                # Stop keepalive before landing
+                self.stop_keepalive()
                 return self.tello.land()
             
             elif action == 'emergency':
+                # Stop keepalive on emergency
+                self.stop_keepalive()
                 self.tello.emergency_stop()
                 return True
             
@@ -380,6 +441,7 @@ If the command is dangerous, set safety_check to false and explain why.
         print(f"  • Max movement: {self.max_distance} cm")
         print(f"  • Max altitude change: {self.max_altitude} cm")
         print(f"  • Safety mode: {'ON' if self.safety_mode else 'OFF'}")
+        print(f"  • Auto-landing prevention: Keepalive every {self.keepalive_interval}s")
         print("="*30)
 
 
