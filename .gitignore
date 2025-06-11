@@ -138,6 +138,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+*.webp
 
 # Temporary files
 *.tmp
