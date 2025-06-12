@@ -370,21 +370,312 @@ If the command is dangerous, set safety_check to false and explain why.
             print(f"❌ Command execution failed: {e}")
             return False
     
+    def validate_command_safety(self, action: str, parameters: Dict) -> Dict[str, Any]:
+        """Enhanced safety validation for commands."""
+        safety_issues = []
+        
+        # Distance safety checks
+        if action in ['move_up', 'move_down']:
+            distance = parameters.get('distance', 30)
+            if distance > self.max_altitude:
+                safety_issues.append(f"Altitude movement {distance}cm exceeds limit {self.max_altitude}cm")
+            elif distance < 20:
+                safety_issues.append(f"Movement distance {distance}cm too small (min 20cm)")
+        
+        elif action in ['move_forward', 'move_back', 'move_left', 'move_right']:
+            distance = parameters.get('distance', 30)
+            if distance > self.max_distance:
+                safety_issues.append(f"Movement {distance}cm exceeds limit {self.max_distance}cm")
+            elif distance < 20:
+                safety_issues.append(f"Movement distance {distance}cm too small (min 20cm)")
+        
+        # Rotation safety checks
+        elif action in ['rotate_clockwise', 'rotate_counter_clockwise']:
+            degrees = parameters.get('degrees', 30)
+            if degrees > 180:
+                safety_issues.append(f"Rotation {degrees}° too large (max 180°)")
+            elif degrees < 15:
+                safety_issues.append(f"Rotation {degrees}° too small (min 15°)")
+        
+        # Flip safety checks
+        elif action in ['flip_forward', 'flip_back', 'flip_left', 'flip_right']:
+            if not self.tello or not self.tello.flying:
+                safety_issues.append("Flips can only be performed while flying")
+        
+        # Emergency and critical commands
+        elif action == 'emergency':
+            # Emergency is always allowed
+            pass
+        
+        return {
+            'safe': len(safety_issues) == 0,
+            'issues': safety_issues,
+            'action': action,
+            'parameters': parameters
+        }
+
+    def parse_multi_commands(self, user_input: str) -> List[Dict[str, Any]]:
+        """Parse natural language input that may contain multiple commands."""
+        
+        system_prompt = f"""You are an AI assistant that controls a Tello drone. Parse natural language commands into specific drone actions.
+
+Available drone commands:
+- takeoff: Take off and hover
+- land: Land the drone safely
+- emergency: Emergency stop (cuts motors immediately)
+- move_up/move_down: Move vertically (20-{self.max_altitude} cm)
+- move_forward/move_back: Move horizontally forward/backward (20-{self.max_distance} cm)
+- move_left/move_right: Move horizontally left/right (20-{self.max_distance} cm)
+- rotate_clockwise/rotate_counter_clockwise: Rotate (15-180 degrees)
+- flip_forward/flip_back/flip_left/flip_right: Perform flips
+- start_video/stop_video: Control video streaming
+- get_status: Get sensor data and drone status
+
+IMPORTANT: You can now parse MULTIPLE commands from a single input.
+
+Safety rules:
+- Maximum movement distance: {self.max_distance} cm
+- Maximum altitude movement: {self.max_altitude} cm
+- Minimum movement: 20 cm, minimum rotation: 15 degrees
+- Flips only while flying
+- Emergency always takes priority
+
+Parse the user's command and respond with a JSON array of command objects:
+[
+    {{
+        "action": "command_name",
+        "parameters": {{"distance": 50, "degrees": 30}},
+        "sequence_order": 1,
+        "safety_check": true/false,
+        "explanation": "What this step will do"
+    }},
+    {{
+        "action": "second_command",
+        "parameters": {{"degrees": 45}},
+        "sequence_order": 2,
+        "safety_check": true/false,
+        "explanation": "What the second step will do"
+    }}
+]
+
+Rules for multi-commands:
+1. Break compound commands into individual actions
+2. Assign sequence_order starting from 1
+3. Each action should be safe and logical
+4. If any action is unsafe, mark safety_check as false
+5. Maximum 5 commands per sequence
+6. Always prioritize safety over complexity
+
+Examples:
+- "move forward 50cm and turn right 30 degrees" = [move_forward, rotate_clockwise]
+- "take off, move up 40cm, then turn left" = [takeoff, move_up, rotate_counter_clockwise]
+- "show status and move back 30cm" = [get_status, move_back]
+"""
+
+        user_prompt = f"Parse this drone command sequence: '{user_input}'"
+        
+        print(f"🤖 Processing multi-command: {user_input}")
+        response = self.query_ollama(user_prompt, system_prompt)
+        
+        try:
+            # Try to extract JSON array from response
+            if '[' in response and ']' in response:
+                start = response.find('[')
+                end = response.rfind(']') + 1
+                json_str = response[start:end]
+                commands = json.loads(json_str)
+                
+                # Ensure it's a list
+                if not isinstance(commands, list):
+                    commands = [commands]
+                
+                # Sort by sequence_order
+                commands.sort(key=lambda x: x.get('sequence_order', 0))
+                
+                return commands
+            else:
+                # Fallback to single command format
+                single_cmd = self.parse_command(user_input)
+                return [single_cmd] if single_cmd.get('action') != 'none' else []
+                
+        except json.JSONDecodeError as e:
+            print(f"⚠️ JSON parsing failed: {e}")
+            # Fallback to single command
+            single_cmd = self.parse_command(user_input)
+            return [single_cmd] if single_cmd.get('action') != 'none' else []
+
+    def execute_command_sequence(self, commands: List[Dict[str, Any]]) -> bool:
+        """Execute a sequence of commands with safety checks."""
+        if not self.tello or not self.tello.connected:
+            print("❌ Drone not connected")
+            return False
+        
+        if len(commands) > 5:
+            print("⚠️ Too many commands in sequence (max 5). Executing first 5.")
+            commands = commands[:5]
+        
+        print(f"🎯 Executing sequence of {len(commands)} commands:")
+        
+        # Pre-validate all commands for safety
+        validation_results = []
+        for i, cmd in enumerate(commands):
+            validation = self.validate_command_safety(cmd.get('action', ''), cmd.get('parameters', {}))
+            validation_results.append(validation)
+            
+            if not validation['safe']:
+                print(f"❌ Command {i+1} failed safety check:")
+                for issue in validation['issues']:
+                    print(f"   - {issue}")
+                
+                if self.safety_mode:
+                    print("🛡️ Sequence blocked by safety mode")
+                    return False
+        
+        # Execute commands in sequence
+        success_count = 0
+        for i, cmd in enumerate(commands):
+            action = cmd.get('action', '')
+            explanation = cmd.get('explanation', '')
+            
+            print(f"\n📋 Step {i+1}: {action}")
+            print(f"   📝 {explanation}")
+            
+            # Add delay between commands for safety
+            if i > 0:
+                print("   ⏳ Waiting 2 seconds before next command...")
+                time.sleep(2)
+            
+            success = self.execute_command(cmd)
+            if success:
+                success_count += 1
+                print(f"   ✅ Step {i+1} completed")
+            else:
+                print(f"   ❌ Step {i+1} failed")
+                
+                # Ask user if they want to continue
+                if i < len(commands) - 1:
+                    try:
+                        continue_choice = input(f"   ⚠️ Continue with remaining {len(commands) - i - 1} commands? (y/n): ").lower()
+                        if continue_choice != 'y':
+                            print("   🛑 Sequence aborted by user")
+                            break
+                    except KeyboardInterrupt:
+                        print("\n   🛑 Sequence interrupted")
+                        break
+        
+        print(f"\n📊 Sequence completed: {success_count}/{len(commands)} commands successful")
+        return success_count == len(commands)
+
     def process_natural_language_command(self, user_input: str) -> bool:
-        """Process a natural language command end-to-end."""
-        # Parse the command using Ollama
-        command_dict = self.parse_command(user_input)
+        """Process a natural language command that may contain multiple actions."""
+        # Parse the command(s) using Ollama
+        commands = self.parse_multi_commands(user_input)
+        
+        if not commands:
+            print("❌ No valid commands found")
+            return False
         
         # Log the interaction
         self.conversation_history.append({
             "user": user_input,
-            "assistant": command_dict.get('explanation', ''),
-            "timestamp": datetime.now().isoformat()
+            "assistant": f"Parsed {len(commands)} commands",
+            "timestamp": datetime.now().isoformat(),
+            "commands": [cmd.get('action', '') for cmd in commands]
         })
         
-        # Execute the command
-        return self.execute_command(command_dict)
+        # Execute the command sequence
+        if len(commands) == 1:
+            print("🎯 Executing single command")
+            return self.execute_command(commands[0])
+        else:
+            print(f"🎯 Executing command sequence ({len(commands)} commands)")
+            return self.execute_command_sequence(commands)
     
+    def configure_safety(self):
+        """Interactive safety configuration."""
+        print("\n🛡️ Safety Configuration")
+        print("="*30)
+        print(f"Current settings:")
+        print(f"  • Safety mode: {'ON' if self.safety_mode else 'OFF'}")
+        print(f"  • Max movement distance: {self.max_distance} cm")
+        print(f"  • Max altitude change: {self.max_altitude} cm")
+        print("="*30)
+        
+        try:
+            # Safety mode toggle
+            safety_choice = input("Enable safety mode? (y/n): ").lower()
+            self.safety_mode = safety_choice == 'y'
+            
+            # Distance limits
+            try:
+                max_dist = input(f"Max movement distance [current: {self.max_distance}cm]: ").strip()
+                if max_dist and max_dist.isdigit():
+                    new_dist = int(max_dist)
+                    if 20 <= new_dist <= 500:
+                        self.max_distance = new_dist
+                    else:
+                        print("⚠️ Distance must be between 20-500cm")
+            except ValueError:
+                print("⚠️ Invalid distance value")
+            
+            # Altitude limits
+            try:
+                max_alt = input(f"Max altitude change [current: {self.max_altitude}cm]: ").strip()
+                if max_alt and max_alt.isdigit():
+                    new_alt = int(max_alt)
+                    if 20 <= new_alt <= 500:
+                        self.max_altitude = new_alt
+                    else:
+                        print("⚠️ Altitude must be between 20-500cm")
+            except ValueError:
+                print("⚠️ Invalid altitude value")
+            
+            print("\n✅ Safety configuration updated!")
+            print(f"  • Safety mode: {'ON' if self.safety_mode else 'OFF'}")
+            print(f"  • Max movement distance: {self.max_distance} cm")
+            print(f"  • Max altitude change: {self.max_altitude} cm")
+            
+        except KeyboardInterrupt:
+            print("\n⚠️ Configuration cancelled")
+
+    def emergency_landing_sequence(self):
+        """Safe emergency landing with status check."""
+        print("🚨 EMERGENCY LANDING SEQUENCE INITIATED")
+        
+        try:
+            # Stop keepalive immediately
+            self.stop_keepalive()
+            
+            # Check current status
+            if self.tello and self.tello.connected:
+                print("📡 Checking drone status...")
+                
+                # Try to land safely first
+                print("🛬 Attempting safe landing...")
+                if self.tello.land():
+                    print("✅ Safe landing completed")
+                    return True
+                else:
+                    # If safe landing fails, try emergency stop
+                    print("⚠️ Safe landing failed, executing emergency stop...")
+                    self.tello.emergency_stop()
+                    print("🛑 Emergency stop executed")
+                    return True
+            else:
+                print("❌ Drone not connected")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Emergency landing failed: {e}")
+            try:
+                # Last resort - emergency stop
+                if self.tello:
+                    self.tello.emergency_stop()
+                    print("🛑 Emergency stop executed as last resort")
+            except:
+                print("❌ All emergency procedures failed")
+            return False
+
     def start_voice_mode(self):
         """Start interactive voice/text mode for natural language control."""
         print("🎤 AI Drone Control Mode Started!")
@@ -392,11 +683,15 @@ If the command is dangerous, set safety_check to false and explain why.
         print("You can now control the drone with natural language!")
         print("Examples:")
         print("  - 'Take off and hover'")
-        print("  - 'Move forward 50 centimeters'")
-        print("  - 'Turn left 45 degrees'")
-        print("  - 'Do a front flip'")
+        print("  - 'Move forward 50 centimeters and turn right 30 degrees'")
+        print("  - 'Do a front flip then move back'")
         print("  - 'Show me the sensor data'")
         print("  - 'Land safely'")
+        print("\nSpecial commands:")
+        print("  - 'help' - Show detailed help")
+        print("  - 'safety' - Configure safety settings")
+        print("  - 'emergency' - Emergency landing sequence")
+        print("  - 'quit/exit' - Stop AI control")
         print("="*50)
         
         while True:
@@ -411,38 +706,53 @@ If the command is dangerous, set safety_check to false and explain why.
                     self.show_help()
                     continue
                 
+                if user_input.lower() == 'safety':
+                    self.configure_safety()
+                    continue
+                
+                if user_input.lower() in ['emergency', 'emergency landing']:
+                    self.emergency_landing_sequence()
+                    continue
+                
                 if user_input:
                     success = self.process_natural_language_command(user_input)
                     if success:
-                        print("✅ Command completed successfully")
+                        print("✅ Command sequence completed successfully")
                     else:
-                        print("❌ Command failed or was blocked")
+                        print("❌ Command sequence failed or was blocked")
                 
             except KeyboardInterrupt:
-                print("\n👋 Stopping AI control mode...")
+                print("\n🚨 Keyboard interrupt detected!")
+                print("Initiating emergency landing sequence...")
+                self.emergency_landing_sequence()
                 break
             except Exception as e:
                 print(f"❌ Error: {e}")
+                print("Type 'emergency' for emergency landing or 'quit' to exit")
     
     def show_help(self):
         """Show help information."""
         print("\n📚 AI Drone Control Help")
-        print("="*30)
-        print("Natural language examples:")
+        print("="*40)
+        print("Single command examples:")
         print("  • 'Take off' - Launch the drone")
         print("  • 'Move up 50 cm' - Ascend 50 centimeters")
         print("  • 'Turn right 30 degrees' - Rotate clockwise")
-        print("  • 'Go forward slowly' - Move forward small distance")
         print("  • 'Do a backflip' - Perform backward flip")
-        print("  • 'Show status' - Display sensor data")
-        print("  • 'Land now' - Safe landing")
-        print("  • 'Emergency stop' - Immediate motor cut")
+        print("\nMulti-command examples:")
+        print("  • 'Move forward 40cm and turn left 45 degrees'")
+        print("  • 'Take off, move up 60cm, then rotate right'")
+        print("  • 'Show status and move back 30cm'")
+        print("  • 'Move left 50cm, turn around, then move forward'")
         print("\nSafety features:")
         print(f"  • Max movement: {self.max_distance} cm")
         print(f"  • Max altitude change: {self.max_altitude} cm")
+        print(f"  • Min movement: 20 cm, min rotation: 15°")
         print(f"  • Safety mode: {'ON' if self.safety_mode else 'OFF'}")
         print(f"  • Auto-landing prevention: Keepalive every {self.keepalive_interval}s")
-        print("="*30)
+        print(f"  • Max commands per sequence: 5")
+        print(f"  • Inter-command delay: 2 seconds")
+        print("="*40)
 
 
 def main():
